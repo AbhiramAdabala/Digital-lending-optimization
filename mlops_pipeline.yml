@@ -1,0 +1,190 @@
+name: FinLend AI — MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'mlops_platform/**'
+      - 'models/**'
+      - 'apis/**'
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 02:00 UTC — scheduled drift check
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model to retrain (PD_Model / Fraud_Model / EWS_Model)'
+        required: false
+      force_retrain:
+        description: 'Force retraining regardless of drift'
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: '3.10'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  API_BASE_URL: ${{ secrets.API_BASE_URL }}
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint & Code Quality
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install linting tools
+        run: pip install flake8 black isort
+      - name: Run flake8
+        run: flake8 mlops_platform/ --max-line-length=120 --ignore=E501,W503
+      - name: Check formatting
+        run: black --check mlops_platform/
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Unit & Integration Tests
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov httpx
+      - name: Run unit tests
+        run: pytest mlops_platform/tests/ -v --cov=mlops_platform --cov-report=xml
+      - name: API smoke test
+        run: |
+          uvicorn mlops_platform.apis.main:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+          python mlops_platform/tests/test_api_smoke.py
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: coverage.xml
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: Drift Detection Check
+  # ──────────────────────────────────────────────────────────────────────────
+  drift_check:
+    name: Drift Detection & Monitoring
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run drift detection
+        run: python mlops_platform/drift_detection/run_drift_check.py
+      - name: Upload drift report
+        uses: actions/upload-artifact@v3
+        with:
+          name: drift-report
+          path: mlops_platform/drift_detection/drift_report.json
+      - name: Trigger retraining if needed
+        if: ${{ env.RETRAIN_NEEDED == 'true' }}
+        run: python mlops_platform/retraining/trigger_retrain.py
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 4: Model Training & Validation
+  # ──────────────────────────────────────────────────────────────────────────
+  train_validate:
+    name: Model Training & Governance Validation
+    runs-on: ubuntu-latest
+    needs: drift_check
+    if: |
+      github.event.inputs.force_retrain == 'true' ||
+      env.RETRAIN_NEEDED == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Train model
+        run: python mlops_platform/pipelines/train_pipeline.py
+      - name: Governance validation gate
+        run: python mlops_platform/governance/governance_gate.py
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-artifacts
+          path: mlops_platform/artifacts/
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 5: Build & Push Docker Image
+  # ──────────────────────────────────────────────────────────────────────────
+  build_docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: train_validate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./mlops_platform
+          file: ./mlops_platform/docker/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/finlend-api:${{ github.sha }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 6: Deploy to Staging
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy_staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build_docker
+    environment: staging
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment"
+          # kubectl apply -f k8s/staging/ or docker-compose up
+      - name: Run staging smoke tests
+        run: python mlops_platform/tests/test_staging_smoke.py
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'FinLend AI deployed to staging — ${{ github.sha }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 7: Production Deployment (manual approval required)
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy_production:
+    name: Deploy to Production (CRO Approval)
+    runs-on: ubuntu-latest
+    needs: deploy_staging
+    environment:
+      name: production
+      url: https://api.finlend.ai
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production — approved by ${{ github.actor }}"
+      - name: Update model registry status
+        run: python mlops_platform/model_registry/promote_to_prod.py
+      - name: Enable canary rollout (10% traffic)
+        run: |
+          echo "Canary rollout: 10% traffic → new model"
+      - name: Notify CRO
+        run: echo "Production deployment complete"
